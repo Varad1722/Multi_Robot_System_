@@ -1,0 +1,453 @@
+function Trial7
+% 3 robots, 3 hotspots with heat potential fields + LiDAR wall avoidance.
+% Visuals:
+%   - Env: robots + faint dotted LiDAR rays + colored potential field
+%          background (blue=cool, red=hot near fires, cooling over time).
+%   - Side window: accumulated LiDAR point cloud from all robots.
+
+clc; close all;
+
+%% ---------------- PARAMETERS ----------------
+N = 3;      % robots
+M = 3;      % hotspots
+
+dt       = 0.1;
+T_total  = 220;
+steps    = round(T_total/dt);
+
+v_nom    = 1.1;
+maxTurn  = deg2rad(20);
+
+R_orbit  = 0.9;
+R_band   = 0.2;
+
+robotRadius   = 0.25;
+safetyCircle  = 0.8;
+d_rep         = 1.2;
+k_rep         = 1.5;
+
+% LiDAR parameters
+lidarMaxRange  = 4.0;
+lidarBeams     = 41;
+wallAvoidDist  = 1.1;
+
+% wall repulsion is handled via lidarWallRepulsion; repRange is passed to it
+repRange       = 0.9;   % wall push only when close
+
+% Behaviour weights
+w_fire = 2.0;
+w_wall = 2.2;   % stronger wall influence (but only near walls)
+w_rep  = 0.8;
+w_fwd  = 0.20;
+w_open = 0.70;
+
+spawnInterval   = 7.0;
+
+% LiDAR logging for map
+lidarLogStride  = 3;    % log every 3rd timestep
+
+% LiDAR ray lifetime (in simulation steps)
+rayLifetimeSec   = 2.0;                          % ~2 seconds
+rayLifetimeSteps = round(rayLifetimeSec/dt);
+
+%% ---------------- ENVIRONMENT ----------------
+env = MultiRobotEnv(N);
+env.robotRadius    = robotRadius * ones(1,N);
+env.showTrajectory = false(1,N);   % no path traces
+env.hasWaypoints   = false;
+
+load exampleMap             % occupancyMap 'map'
+assignin('base','map',map);
+env.mapName = 'map';
+
+W = map.XWorldLimits;
+H = map.YWorldLimits;
+
+%% ---------------- HOTSPOTS (fixed-ish) ----------------
+baseCenters = [ 8 5;    % lower-right
+                 3 11;      % upper-left
+                11 11]';    % upper-right
+
+hotspots = zeros(2,M);
+for j = 1:M
+    cand  = baseCenters(:,j);
+    tries = 0;
+    while checkOccupancy(map,cand') > 0.45 && tries < 50
+        cand = cand + 0.3*randn(2,1);
+        tries = tries + 1;
+    end
+    hotspots(:,j) = cand;
+end
+
+%% ---------------- ENTRY ----------------
+entry = [W(1)+1.5; H(1)+1.5];
+while checkOccupancy(map, entry') > 0.45
+    entry(1) = entry(1) + 0.2;
+end
+
+poses = [repmat(entry,1,N); rand(1,N)*2*builtin('pi')];
+
+targetFire = zeros(1,N);
+mode       = repmat("EXPLORE",1,N);
+
+% store last LiDAR for visualization
+lastRel    = zeros(lidarBeams,N);
+lastRanges = zeros(lidarBeams,N);
+
+% LiDAR point cloud for map
+pcX = [];
+pcY = [];
+
+% handles + creation steps for temporary LiDAR rays
+rayHandles = gobjects(0);
+raySteps   = [];
+
+% ----- heat "level" for each fire (for visualization & cooling) -----
+heatLevel   = ones(1,M);    % 1 = hottest, 0 = cooled
+coolRate    = 0.05;         % per second when being handled
+
+% ----- potential field grid (for background visualization) -----
+Nx = 120; Ny = 120;
+[xg, yg] = meshgrid(linspace(W(1),W(2),Nx), linspace(H(1),H(2),Ny));
+
+occMask   = zeros(Ny,Nx);
+for idx = 1:numel(xg)
+    p = [xg(idx), yg(idx)];
+    occMask(idx) = checkOccupancy(map,p);
+end
+sigmaField = 1.1;   % spread of each heat bump
+
+hImg = [];          % handle to imagesc background (created later)
+
+% map figure (placed to the right of env later)
+figMap = figure('Name','LiDAR Point Cloud Map');
+axMap  = axes(figMap);
+hold(axMap,'on');
+axis(axMap,'equal');
+set(axMap,'Color','k');
+set(figMap,'Color','w');
+xlim(axMap,W); ylim(axMap,H);
+xlabel(axMap,'X [m]');
+ylabel(axMap,'Y [m]');
+title(axMap,'Accumulated LiDAR Point Cloud Map (all robots)');
+hPC = scatter(axMap, nan, nan, 5, 'c','filled');
+
+envFig = [];   % will grab this after first env() call
+
+%% ---------------- MAIN LOOP ----------------
+for k = 1:steps
+    t = (k-1)*dt;
+
+    activeN   = min(N, floor(t/spawnInterval) + 1);
+    activePos = poses(1:2,1:activeN);
+
+    % (1) fires already assigned?
+    handledCount = zeros(1,M);
+    for j = 1:M
+        handledCount(j) = nnz(targetFire(1:activeN) == j);
+    end
+    heatStrength = double(handledCount == 0);  % for attraction controller
+
+    % cool fires that have at least one robot working on them
+    for j = 1:M
+        if handledCount(j) > 0
+            heatLevel(j) = max(0, heatLevel(j) - coolRate*dt);
+        end
+    end
+
+    % (2) assign robots touching heat circle
+    for i = 1:activeN
+        if targetFire(i) ~= 0
+            continue;
+        end
+        pi = activePos(:,i);
+        for j = 1:M
+            if heatStrength(j) == 0
+                continue;
+            end
+            distToFire = norm(pi - hotspots(:,j));
+            if abs(distToFire - R_orbit) <= R_band
+                targetFire(i)  = j;
+                mode(i)        = "GOTO_FIRE";
+                handledCount(j) = handledCount(j) + 1;
+                heatStrength(j) = 0;
+                break;
+            end
+        end
+    end
+
+    % (3) velocity field
+    vel = zeros(2,activeN);
+
+    for i = 1:activeN
+        pi    = activePos(:,i);
+        theta = poses(3,i);
+
+        % LiDAR sense
+        [relAng, ranges] = virtualLidar(pi, theta, map, lidarMaxRange, lidarBeams);
+        lastRel(:,i)    = relAng(:);
+        lastRanges(:,i) = ranges(:);
+
+        % log LiDAR hits for map (every few steps)
+        if mod(k, lidarLogStride) == 0
+            for b = 1:lidarBeams
+                ang = theta + relAng(b);
+                r   = min(ranges(b), lidarMaxRange);
+                hit = pi + r*[cos(ang); sin(ang)];
+                pcX(end+1,1) = hit(1); %#ok<AGROW>
+                pcY(end+1,1) = hit(2); %#ok<AGROW>
+            end
+        end
+
+        % wall repulsion from LiDAR (short-range, strong)
+        v_wall = lidarWallRepulsion(theta, relAng, ranges, repRange);
+
+        % OPEN-SPACE direction: beam with max range
+        [~, idxOpen] = max(ranges);
+        theta_open   = theta + relAng(idxOpen);
+        v_open       = [cos(theta_open); sin(theta_open)];
+
+        % robot–robot repulsion
+        v_rep = [0;0];
+        for j = 1:activeN
+            if j == i
+                continue;
+            end
+            diff = pi - activePos(:,j);
+            d    = norm(diff);
+            if d < d_rep && d > 1e-3
+                grad = (1/d - 1/d_rep) * (diff / (d^2));
+                if d < safetyCircle
+                    grad = 3*grad;
+                end
+                v_rep = v_rep + k_rep*grad;
+            end
+        end
+
+        % forward bias
+        v_fwd = [cos(theta); sin(theta)];
+
+        % --------- heat potential / orbit ----------
+        v_fire = [0;0];
+
+        if targetFire(i) == 0
+            % not assigned → feel heat from unassigned fires
+            for j = 1:M
+                if heatStrength(j) <= 0
+                    continue;
+                end
+                vec  = hotspots(:,j) - pi;
+                dist = norm(vec);
+                if dist < 1e-3
+                    continue;
+                end
+                v_fire = v_fire + heatStrength(j)*vec/(dist^2);
+            end
+            if norm(v_fire) > 1e-6
+                v_fire = v_fire / norm(v_fire);
+            end
+        else
+            % assigned → approach and orbit its fire
+            j  = targetFire(i);
+            cj = hotspots(:,j);
+            r  = pi - cj;
+            dist = norm(r);
+
+            if mode(i) == "GOTO_FIRE"
+                if dist > R_orbit + R_band
+                    v_fire = (cj - pi)/dist;
+                elseif dist < R_orbit - R_band
+                    v_fire = (pi - cj)/dist;
+                else
+                    mode(i) = "ORBIT";
+                end
+            end
+
+            if mode(i) == "ORBIT"
+                if dist < 1e-3
+                    v_fire = [1;0];
+                else
+                    er   = dist - R_orbit;
+                    rhat = r/dist;
+                    that = [0 -1; 1 0]*rhat;
+                    v_fire = that - 0.5*er*rhat;
+                end
+            end
+        end
+
+        % bias when wall is close directly ahead:
+        [~, idxFront] = min(abs(relAng));
+        frontRange    = ranges(idxFront);
+        if frontRange < wallAvoidDist
+            v_fwd = 0.1*v_fwd + 0.3*v_wall + 0.6*v_open;
+        end
+
+        % combine components
+        v_total = w_fire*v_fire + w_wall*v_wall + w_rep*v_rep + ...
+                  w_fwd*v_fwd + w_open*v_open;
+
+        if norm(v_total) > 1e-6
+            v_total = v_total / norm(v_total);
+        else
+            v_total = [0;0];
+        end
+
+        vel(:,i) = v_total;
+    end
+
+    % (4) apply motion
+    for i = 1:activeN
+        dir = vel(:,i);
+        if norm(dir) < 1e-6
+            continue;
+        end
+
+        theta_des = atan2(dir(2), dir(1));
+        theta_now = poses(3,i);
+        dtheta    = wrapToPi_local(theta_des - theta_now);
+
+        if dtheta > maxTurn
+            dtheta = maxTurn;
+        elseif dtheta < -maxTurn
+            dtheta = -maxTurn;
+        end
+
+        theta_new   = wrapToPi_local(theta_now + dtheta);
+        poses(3,i)  = theta_new;
+
+        moveDir = [cos(theta_new); sin(theta_new)];
+        step    = v_nom * moveDir * dt;
+        newPos  = poses(1:2,i) + step;
+
+        occ = checkOccupancy(map,newPos');
+        if occ > 0.45
+            % strong 90° bounce off wall
+            sideTurn = builtin('pi')/2;  % 90 degrees
+
+            for attempt = 1:2
+                sideSign  = (attempt==1)*1 + (attempt==2)*-1;
+                theta_try = wrapToPi_local(theta_new + sideSign*sideTurn);
+                step2     = v_nom * [cos(theta_try); sin(theta_try)]*dt;
+                cand      = poses(1:2,i) + step2;
+
+                if checkOccupancy(map,cand') < 0.45 && ...
+                        safeStepRelative(cand, poses(:,1:activeN), i, safetyCircle)
+                    poses(1:2,i) = cand;
+                    poses(3,i)   = theta_try;
+                    break;
+                end
+            end
+        else
+            if safeStepRelative(newPos, poses(:,1:activeN), i, safetyCircle)
+                poses(1:2,i) = newPos;
+            end
+        end
+    end
+
+    % (5) main visualisation (potential background + robots + fires + LiDAR rays)
+    env(1:activeN, poses(:,1:activeN));
+    axEnv = gca;
+
+    % on first loop, position map window next to env window
+    if isempty(envFig)
+        envFig = ancestor(axEnv,'figure');
+        if ishghandle(envFig) && ishghandle(figMap)
+            envPos = get(envFig,'Position');
+            mapPos = envPos;
+            mapPos(1) = envPos(1) + envPos(3) + 20; % shift to the right
+            set(figMap,'Position',mapPos);
+        end
+    end
+
+    axes(axEnv); %#ok<LAXES>
+    hold(axEnv,'on');
+
+    % ----- draw / update potential field background -----
+    phi = zeros(size(xg));
+    for j = 1:M
+        if heatLevel(j) <= 0
+            continue;
+        end
+        dx = xg - hotspots(1,j);
+        dy = yg - hotspots(2,j);
+        phi = phi + heatLevel(j) * exp(-(dx.^2 + dy.^2)/(2*sigmaField^2));
+    end
+    phi(occMask > 0.45) = NaN;     % no heat drawn on walls
+
+    if isempty(hImg)
+        hImg = imagesc(axEnv, W, H, phi);
+        set(axEnv,'YDir','normal');
+        colormap(axEnv, jet);      % blue → green → yellow → red
+        caxis(axEnv,[0 1]);        % normalize
+        cb = colorbar(axEnv);
+        ylabel(cb,'Heat / potential');
+        set(hImg,'AlphaData', ~isnan(phi)*0.6);   % semi-transparent
+    else
+        set(hImg, 'CData', phi, 'AlphaData', ~isnan(phi)*0.6);
+    end
+
+    % fires + orbit circles
+    plot(axEnv, hotspots(1,:), hotspots(2,:), 'rx', 'MarkerSize', 14, 'LineWidth', 2);
+    for j = 1:M
+        text(hotspots(1,j)+0.2, hotspots(2,j)+0.2, sprintf('X%d', j), ...
+             'Color','r','FontSize',10,'FontWeight','bold','Parent',axEnv);
+        th = linspace(0, 2*builtin('pi'), 80);
+        xc = hotspots(1,j) + R_orbit*cos(th);
+        yc = hotspots(2,j) + R_orbit*sin(th);
+        plot(axEnv, xc, yc, 'w:', 'LineWidth', 1);
+    end
+
+    % ---- delete LiDAR rays that are older than lifetime ----
+    if ~isempty(rayHandles)
+        isOld = raySteps < k - rayLifetimeSteps;
+        toDel = rayHandles(isOld);
+        delete(toDel(isvalid(toDel)));
+        rayHandles(isOld) = [];
+        raySteps(isOld)   = [];
+    end
+
+    % --- draw 2 short, faint, dotted LiDAR beams per robot ---
+    desiredRel = [-builtin('pi')/8, +builtin('pi')/8];   % ±22.5° around heading
+    rayColor   = [0.7 0.9 1.0];    % pale cyan
+    lineW      = 0.6;              % thin dotted line
+    visFactor  = 0.35;             % shorten rays to 35% of sensed range
+
+    for i = 1:activeN
+        p0     = poses(1:2,i);
+        theta0 = poses(3,i);
+        rel    = lastRel(:,i);
+        rngs   = lastRanges(:,i);
+
+        for dIdx = 1:2
+            targetRel = desiredRel(dIdx);
+
+            % pick nearest sensed beam to target direction
+            [~, idxB] = min(abs(rel - targetRel));
+
+            ang = theta0 + rel(idxB);
+
+            rTrue = min(rngs(idxB), lidarMaxRange);
+            rVis  = visFactor * rTrue;       % shorten visually
+
+            p1  = p0 + rVis*[cos(ang); sin(ang)];
+
+            % dotted, faint, thin line
+            hL  = plot(axEnv, [p0(1) p1(1)], [p0(2) p1(2)], '--', ...
+                       'Color', rayColor, 'LineWidth', lineW);
+
+            rayHandles(end+1,1) = hL; %#ok<AGROW>
+            raySteps(end+1,1)   = k;  %#ok<AGROW>
+        end
+    end
+
+    hold(axEnv,'off');
+    xlim(axEnv,W); ylim(axEnv,H);
+    title(axEnv,sprintf('Heat-potential MRS: 3 robots, 3 fires (t = %.1f s)', t));
+    drawnow limitrate;
+
+    % (6) update parallel point-cloud map
+    set(hPC, 'XData', pcX, 'YData', pcY);
+    drawnow limitrate;
+end
+
+end
